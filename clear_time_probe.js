@@ -11,10 +11,22 @@
  *   0=普通 1=噩梦 2=地狱 3=折磨
  */
 
-var GA = Process.enumerateModules().find(function (m) {
-  return m.name.toLowerCase().indexOf('gameassembly') !== -1;
-});
-if (!GA) throw new Error('GameAssembly.dll not found');
+function findGameAssembly(timeoutMs) {
+  timeoutMs = timeoutMs || 0;
+  var deadline = Date.now() + timeoutMs;
+  while (true) {
+    var mod = Process.enumerateModules().find(function (m) {
+      return m.name.toLowerCase().indexOf('gameassembly') !== -1;
+    });
+    if (mod) return mod;
+    if (Date.now() >= deadline) return null;
+    Thread.sleep(0.2);
+  }
+}
+
+// 重启游戏后模块可能晚于进程出现，最多等 30s
+var GA = findGameAssembly(30000);
+if (!GA) throw new Error('GameAssembly.dll not found (waited 30s)');
 
 function api(name, ret, args) {
   return new NativeFunction(GA.getExportByName(name), ret, args);

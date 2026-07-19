@@ -77,7 +77,7 @@ JSON_PATH = DATA_DIR / "clear_times.json"
 CONFIG_PATH = DATA_DIR / "config.json"
 LOG_PATH = DATA_DIR / "tray.log"
 MAX_PER_STAGE = 10
-APP_VERSION = "1.1.0"  # 区分难度 普通/噩梦/地狱/折磨
+APP_VERSION = "1.1.1"  # 游戏重启后自动重连
 
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
@@ -171,6 +171,10 @@ class ClearTimeMonitor:
         self._stop = threading.Event()
         self._worker = None
         self._on_hit = None
+        self._last_attach_error = ""
+        self._attach_fail_count = 0
+        self._last_health_ok_at = 0.0
+        self._detached_event = threading.Event()
 
     def set_on_hit(self, cb):
         self._on_hit = cb
@@ -182,15 +186,15 @@ class ClearTimeMonitor:
         if self.is_running():
             return
         self._stop.clear()
+        self._detached_event.clear()
         self._worker = threading.Thread(target=self._run_loop, name="frida-monitor", daemon=True)
         self._worker.start()
         log("监控线程已启动")
 
     def stop(self):
         self._stop.set()
-        self._detach()
+        self._detach(reason="stop")
         self.status = "已停止"
-        # 退出前再落盘一次，确保表格持久
         try:
             self.store._write_json()
             self.store._write_workbook()
@@ -198,68 +202,215 @@ class ClearTimeMonitor:
             log(f"退出保存数据: {exc}")
         log("监控已停止")
 
-    def _detach(self):
+    def _detach(self, reason: str = ""):
         with self._lock:
-            try:
-                if self.script:
-                    self.script.unload()
-            except Exception:
-                pass
-            try:
-                if self.session:
-                    self.session.detach()
-            except Exception:
-                pass
+            script = self.script
+            session = self.session
+            pid = self.attached_pid
             self.script = None
             self.session = None
             self.device = None
             self.attached_pid = None
+        if reason:
+            log(f"断开附加 pid={pid or '-'} reason={reason}")
+        try:
+            if script is not None:
+                script.unload()
+        except Exception:
+            pass
+        try:
+            if session is not None:
+                session.detach()
+        except Exception:
+            pass
 
-    def _find_pid(self):
+    def _find_game_processes(self):
         import frida
 
         device = frida.get_local_device()
         matches = []
         for p in device.enumerate_processes():
             name = (p.name or "").lower().replace(" ", "")
+            # TaskBarHero.exe / TaskbarHero.exe
             if "taskbarhero" in name:
                 matches.append(p)
+        return device, matches
+
+    def _pick_pid(self, matches):
         if not matches:
-            return None, None
-        target = matches[0]
-        return device, int(target.pid)
+            return None
+        # 多开时优先选 pid 较大的（通常是较新启动的主进程）
+        matches = sorted(matches, key=lambda p: int(p.pid), reverse=True)
+        return int(matches[0].pid)
+
+    def _process_alive(self, pid) -> bool:
+        if not pid:
+            return False
+        try:
+            import frida
+
+            for p in frida.get_local_device().enumerate_processes():
+                if int(p.pid) == int(pid):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _wait_game_ready(self, session, pid: int, timeout_sec: float = 45.0) -> bool:
+        """游戏刚启动时 GameAssembly 可能尚未加载，轮询等待。"""
+        deadline = time.time() + timeout_sec
+        last_log = 0.0
+        while time.time() < deadline and not self._stop.is_set():
+            if not self._process_alive(pid):
+                return False
+            try:
+                # 在目标进程内查模块
+                api = session.get_api() if hasattr(session, "get_api") else None
+            except Exception:
+                api = None
+            try:
+                # 通过临时脚本探测模块更可靠
+                probe = session.create_script(
+                    r"""
+'use strict';
+var names = Process.enumerateModules().map(function(m){ return m.name.toLowerCase(); });
+var hit = names.some(function(n){ return n.indexOf('gameassembly') >= 0; });
+send({ kind: 'module_probe', hit: hit, count: names.length });
+"""
+                )
+                result = {"hit": False}
+
+                def on_msg(message, data):
+                    if message.get("type") == "send":
+                        payload = message.get("payload") or {}
+                        if payload.get("kind") == "module_probe":
+                            result["hit"] = bool(payload.get("hit"))
+
+                probe.on("message", on_msg)
+                probe.load()
+                time.sleep(0.15)
+                try:
+                    probe.unload()
+                except Exception:
+                    pass
+                if result["hit"]:
+                    return True
+            except Exception as exc:
+                now = time.time()
+                if now - last_log > 5:
+                    log(f"等待 GameAssembly: {exc}")
+                    last_log = now
+            self.status = f"等待游戏模块 pid={pid}"
+            time.sleep(1.0)
+        return False
+
+    def _on_session_detached(self, reason, crash):
+        log(f"Frida 会话断开: reason={reason} crash={crash}")
+        self._detached_event.set()
+        # 不在回调里重操作 session，交给主循环
+        with self._lock:
+            self.script = None
+            self.session = None
+            self.device = None
+            self.attached_pid = None
+        self.status = "等待游戏(会话断开)"
 
     def _attach(self) -> bool:
         if not SCRIPT_PATH.exists():
             self.status = "缺少探针脚本"
             log(f"找不到 {SCRIPT_PATH}")
             return False
-        device, pid = self._find_pid()
+        try:
+            device, matches = self._find_game_processes()
+        except Exception as exc:
+            self.status = f"枚举进程失败: {exc}"
+            log(f"枚举进程失败: {exc}")
+            return False
+        pid = self._pick_pid(matches)
         if not pid:
             self.status = "未找到游戏进程"
             return False
+
+        # 先清掉旧会话，避免游戏重启后挂着死 session
+        self._detach(reason="reattach")
+        self._detached_event.clear()
+
         try:
-            self._detach()
             self.device = device
             self.session = device.attach(pid)
+            try:
+                self.session.on("detached", self._on_session_detached)
+            except Exception:
+                pass
+
+            # 等 IL2CPP 模块就绪（重启后关键失败点）
+            if not self._wait_game_ready(self.session, pid, timeout_sec=60.0):
+                self.status = "游戏模块未就绪"
+                log(f"pid={pid} 等待 GameAssembly 超时或进程退出")
+                self._detach(reason="module-timeout")
+                return False
+
             source = SCRIPT_PATH.read_text(encoding="utf-8")
             self.script = self.session.create_script(source)
             self.script.on("message", self._on_message)
             self.script.load()
+
+            # 健康检查：rpc 或短暂等待 status
+            time.sleep(0.3)
+            try:
+                stats = self.script.exports_sync.stats()
+                log(f"探针就绪 stats={stats}")
+            except Exception:
+                try:
+                    stats = self.script.exports.stats()
+                    log(f"探针就绪 stats={stats}")
+                except Exception as exc:
+                    log(f"探针 stats 调用失败(可忽略): {exc}")
+
             self.attached_pid = pid
+            self._attach_fail_count = 0
+            self._last_health_ok_at = time.time()
             self.status = f"监控中 pid={pid}"
-            log(f"已附加 TaskBarHero pid={pid}")
+            log(f"已附加 TaskBarHero pid={pid}（含 GameAssembly 就绪检测）")
             return True
         except Exception as exc:
+            self._attach_fail_count += 1
+            self._last_attach_error = str(exc)
             self.status = f"附加失败: {exc}"
-            log(f"附加失败: {exc}\n{traceback.format_exc()}")
-            self._detach()
+            log(f"附加失败 pid={pid}: {exc}\n{traceback.format_exc()}")
+            self._detach(reason="attach-fail")
+            return False
+
+    def _health_check(self) -> bool:
+        """确认进程仍在且 Frida 会话可用；失败则应重连。"""
+        if self._detached_event.is_set():
+            return False
+        pid = self.attached_pid
+        if not self._process_alive(pid):
+            return False
+        if self.session is None or self.script is None:
+            return False
+        # 周期性 rpc，确认脚本还活着
+        now = time.time()
+        if now - self._last_health_ok_at < 5.0:
+            return True
+        try:
+            exports = getattr(self.script, "exports_sync", None) or self.script.exports
+            exports.stats()
+            self._last_health_ok_at = now
+            return True
+        except Exception as exc:
+            log(f"健康检查失败，将重连: {exc}")
             return False
 
     def _on_message(self, message, data):
         try:
             if message.get("type") == "error":
-                log(f"Frida error: {message.get('description') or message}")
+                desc = str(message.get("description") or message)
+                log(f"Frida error: {desc}")
+                # 脚本崩溃后标记需重连
+                if "GameAssembly" in desc or "not found" in desc.lower():
+                    self._detached_event.set()
                 return
             if message.get("type") != "send":
                 return
@@ -271,6 +422,7 @@ class ClearTimeMonitor:
             if kind == "fatal":
                 log(f"探针致命错误: {payload.get('error')}")
                 self.status = "探针错误"
+                self._detached_event.set()
                 return
             if kind != "clear_time":
                 return
@@ -294,9 +446,7 @@ class ClearTimeMonitor:
             self.hit_count += 1
             disp = snap.get("display") or f"{difficulty} {stage}"
             self.last_hit = f"{disp} {sec}秒 (均{snap['average']}s / {snap['count']}次)"
-            log(
-                f"通关 {self.last_hit} diffSrc={diff_src} raw={payload.get('raw')}"
-            )
+            log(f"通关 {self.last_hit} diffSrc={diff_src} raw={payload.get('raw')}")
             if self._on_hit:
                 try:
                     self._on_hit(snap)
@@ -315,28 +465,31 @@ class ClearTimeMonitor:
                 time.sleep(5)
                 continue
 
-            if self.session is None:
+            need_attach = self.session is None or self.script is None or self._detached_event.is_set()
+            if not need_attach:
+                # 进程换了 pid（重启）也要重连
+                try:
+                    _device, matches = self._find_game_processes()
+                    pids = {int(p.pid) for p in matches}
+                    if self.attached_pid and self.attached_pid not in pids:
+                        log(f"检测到游戏 PID 变化: 旧={self.attached_pid} 现={sorted(pids)}")
+                        need_attach = True
+                    elif not self._health_check():
+                        need_attach = True
+                except Exception as exc:
+                    log(f"巡检异常: {exc}")
+                    need_attach = True
+
+            if need_attach:
+                if self.session is not None or self.script is not None:
+                    self._detach(reason="reconnect")
+                self._detached_event.clear()
                 ok = self._attach()
                 if not ok:
-                    time.sleep(3)
-                    continue
-            else:
-                try:
-                    import frida
-
-                    alive = any(
-                        p.pid == self.attached_pid
-                        for p in frida.get_local_device().enumerate_processes()
-                    )
-                    if not alive:
-                        log("游戏进程已退出，等待重连")
-                        self.status = "等待游戏"
-                        self._detach()
-                        time.sleep(2)
-                        continue
-                except Exception:
-                    self._detach()
-                    time.sleep(2)
+                    # 退避，避免疯狂刷日志
+                    delay = min(8.0, 2.0 + self._attach_fail_count * 0.5)
+                    self.status = self.status or "等待游戏"
+                    time.sleep(delay)
                     continue
             time.sleep(1.5)
 
@@ -448,7 +601,8 @@ def main():
 
     def action_reconnect(icon, item):
         log("手动重连…")
-        monitor._detach()
+        monitor._detached_event.set()
+        monitor._detach(reason="manual")
         monitor.status = "重连中…"
 
     def action_toggle_notify(icon, item):
