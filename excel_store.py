@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-"""按关卡保存最近 N 次通关时间到 Excel，并计算平均。"""
+"""按关卡持久化通关时间（JSON 主存 + Excel 同步），关闭后不清空。"""
 from __future__ import annotations
 
+import json
+import shutil
 import threading
 from collections import defaultdict, deque
 from datetime import datetime
@@ -17,9 +19,45 @@ HISTORY_SHEET = "明细"
 SUMMARY_SHEET = "汇总"
 
 
+def _parse_dt(value) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now()
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ):
+        try:
+            return datetime.strptime(text[:26], fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except Exception:
+        return datetime.now()
+
+
 class ExcelStore:
-    def __init__(self, path: Path, max_per_stage: int = MAX_PER_STAGE):
-        self.path = Path(path)
+    """
+    持久化策略：
+    - JSON（clear_times.json）为主数据源，重启必加载
+    - Excel（clear_times.xlsx）为可读副本，每次变更同步
+    - 每关仅保留最近 max_per_stage 次（用于平均），滚动丢弃最旧
+    - 关闭软件不会清空；加载失败时绝不覆盖已有文件
+    """
+
+    def __init__(
+        self,
+        excel_path: Path,
+        max_per_stage: int = MAX_PER_STAGE,
+        json_path: Optional[Path] = None,
+    ):
+        self.path = Path(excel_path)
+        self.json_path = Path(json_path) if json_path else self.path.with_suffix(".json")
         self.max_per_stage = max(1, int(max_per_stage))
         self._lock = threading.RLock()
         # stage -> deque of (seconds, recorded_at, notice_time)
@@ -27,44 +65,167 @@ class ExcelStore:
             lambda: deque(maxlen=self.max_per_stage)
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._load_or_init()
-
-    def _load_or_init(self) -> None:
-        if not self.path.exists():
-            self._write_workbook()
-            return
+        self._load_persistent()
+        # 启动时同步一份 Excel（不丢数据）
         try:
-            wb = load_workbook(self.path, data_only=True)
-            if HISTORY_SHEET in wb.sheetnames:
-                ws = wb[HISTORY_SHEET]
-                # 从明细重建：按关卡取时间序最后 N 条
-                rows = []
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    if not row or not row[0]:
+            self._write_workbook()
+            self._write_json()
+        except Exception:
+            pass
+
+    def _new_deque(self) -> Deque[Tuple[int, datetime, str]]:
+        return deque(maxlen=self.max_per_stage)
+
+    def _load_persistent(self) -> None:
+        """优先 JSON，其次 Excel 明细；失败则保持内存空且不破坏磁盘文件。"""
+        if self._load_json():
+            return
+        if self._load_excel():
+            # 从 Excel 恢复后立刻落 JSON，避免下次再丢
+            try:
+                self._write_json()
+            except Exception:
+                pass
+            return
+        # 全新安装：生成空表
+        if not self.path.exists() and not self.json_path.exists():
+            try:
+                self._write_workbook()
+                self._write_json()
+            except Exception:
+                pass
+
+    def _load_json(self) -> bool:
+        if not self.json_path.exists():
+            return False
+        try:
+            raw = json.loads(self.json_path.read_text(encoding="utf-8"))
+            stages = raw.get("stages") if isinstance(raw, dict) else None
+            if not isinstance(stages, dict):
+                return False
+            loaded: Dict[str, Deque[Tuple[int, datetime, str]]] = {}
+            for stage, items in stages.items():
+                stage = str(stage).strip()
+                if not stage or not isinstance(items, list):
+                    continue
+                dq = self._new_deque()
+                for it in items:
+                    if not isinstance(it, dict):
                         continue
-                    stage = str(row[0]).strip()
                     try:
-                        sec = int(row[1])
+                        sec = int(it.get("seconds"))
                     except Exception:
                         continue
-                    rec_at = row[2]
-                    notice = str(row[3] or "")
-                    if isinstance(rec_at, datetime):
-                        dt = rec_at
-                    else:
-                        try:
-                            dt = datetime.fromisoformat(str(rec_at))
-                        except Exception:
-                            dt = datetime.now()
-                    rows.append((stage, sec, dt, notice))
-                rows.sort(key=lambda x: x[2])
-                for stage, sec, dt, notice in rows:
-                    self._data[stage].append((sec, dt, notice))
-            wb.close()
+                    dt = _parse_dt(it.get("recorded_at"))
+                    notice = str(it.get("notice_time") or "")
+                    dq.append((sec, dt, notice))
+                if dq:
+                    loaded[stage] = dq
+            self._data = defaultdict(self._new_deque, loaded)
+            return True
         except Exception:
-            # 损坏则重建空表，不丢程序
-            self._data.clear()
-        self._write_workbook()
+            return False
+
+    def _load_excel(self) -> bool:
+        if not self.path.exists():
+            return False
+        try:
+            # 不用 data_only，避免公式/缓存导致空值
+            wb = load_workbook(self.path, data_only=False)
+            sheet_name = HISTORY_SHEET if HISTORY_SHEET in wb.sheetnames else None
+            if sheet_name is None and SUMMARY_SHEET in wb.sheetnames:
+                # 仅有汇总时也能部分恢复
+                return self._load_from_summary(wb)
+            if sheet_name is None:
+                wb.close()
+                return False
+
+            ws = wb[sheet_name]
+            rows = []
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row or not row[0]:
+                    continue
+                stage = str(row[0]).strip()
+                try:
+                    sec = int(row[1])
+                except Exception:
+                    continue
+                dt = _parse_dt(row[2])
+                notice = str(row[3] or "") if len(row) > 3 else ""
+                rows.append((stage, sec, dt, notice))
+            wb.close()
+            rows.sort(key=lambda x: x[2])
+            loaded: Dict[str, Deque[Tuple[int, datetime, str]]] = {}
+            for stage, sec, dt, notice in rows:
+                if stage not in loaded:
+                    loaded[stage] = self._new_deque()
+                loaded[stage].append((sec, dt, notice))
+            if not loaded:
+                return False
+            self._data = defaultdict(self._new_deque, loaded)
+            return True
+        except Exception:
+            return False
+
+    def _load_from_summary(self, wb) -> bool:
+        try:
+            ws = wb[SUMMARY_SHEET]
+            loaded: Dict[str, Deque[Tuple[int, datetime, str]]] = {}
+            headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+            # 第1次(秒) ... 第N次(秒)
+            sec_cols = []
+            for i, h in enumerate(headers):
+                if h and str(h).startswith("第") and "次" in str(h):
+                    sec_cols.append(i)
+            stage_i = 0
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row or not row[stage_i]:
+                    continue
+                stage = str(row[stage_i]).strip()
+                dq = self._new_deque()
+                for ci in sec_cols:
+                    if ci >= len(row):
+                        continue
+                    v = row[ci]
+                    if v is None or v == "":
+                        continue
+                    try:
+                        dq.append((int(v), datetime.now(), ""))
+                    except Exception:
+                        continue
+                if dq:
+                    loaded[stage] = dq
+            wb.close()
+            if not loaded:
+                return False
+            self._data = defaultdict(self._new_deque, loaded)
+            return True
+        except Exception:
+            try:
+                wb.close()
+            except Exception:
+                pass
+            return False
+
+    def _write_json(self) -> None:
+        payload = {
+            "version": 1,
+            "max_per_stage": self.max_per_stage,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "stages": {},
+        }
+        for stage, items in self._data.items():
+            payload["stages"][stage] = [
+                {
+                    "seconds": sec,
+                    "recorded_at": dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "notice_time": notice,
+                }
+                for sec, dt, notice in items
+            ]
+        tmp = self.json_path.with_suffix(self.json_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.json_path)
 
     def add_clear(
         self,
@@ -85,8 +246,23 @@ class ExcelStore:
 
         with self._lock:
             self._data[stage].append((sec, dt, notice))
-            self._write_workbook()
+            self._persist_all()
             return self.stage_snapshot(stage)
+
+    def _persist_all(self) -> None:
+        """先 JSON 后 Excel；Excel 失败不回滚 JSON。"""
+        self._write_json()
+        try:
+            self._write_workbook()
+        except Exception:
+            # 文件被占用等：保留 JSON，下次启动/打开再同步
+            try:
+                bak = self.path.with_suffix(".xlsx.bak")
+                if self.path.exists():
+                    shutil.copy2(self.path, bak)
+            except Exception:
+                pass
+            raise
 
     def stage_snapshot(self, stage: str) -> dict:
         with self._lock:
@@ -99,7 +275,7 @@ class ExcelStore:
             "seconds": secs,
             "average": avg,
             "last_seconds": secs[-1] if secs else None,
-            "last_at": items[-1][1].isoformat(sep=" ", timespec="seconds") if items else "",
+            "last_at": items[-1][1].strftime("%Y-%m-%d %H:%M:%S") if items else "",
             "notice_time": items[-1][2] if items else "",
         }
 
@@ -107,6 +283,10 @@ class ExcelStore:
         with self._lock:
             stages = sorted(self._data.keys(), key=self._stage_sort_key)
         return [self.stage_snapshot(s) for s in stages]
+
+    def record_count(self) -> int:
+        with self._lock:
+            return sum(len(v) for v in self._data.values())
 
     @staticmethod
     def _stage_sort_key(stage: str):
@@ -118,7 +298,6 @@ class ExcelStore:
 
     def _write_workbook(self) -> None:
         wb = Workbook()
-        # ---- 汇总 ----
         ws_sum = wb.active
         ws_sum.title = SUMMARY_SHEET
         headers = (
@@ -158,7 +337,6 @@ class ExcelStore:
         ws_sum.column_dimensions["A"].width = 10
         ws_sum.column_dimensions[get_column_letter(4 + self.max_per_stage)].width = 20
 
-        # ---- 明细（完整历史，保留最近 max*关卡数 的扩展：写全部内存中的最近N）----
         ws_hist = wb.create_sheet(HISTORY_SHEET)
         hist_headers = ["关卡", "通关秒数", "记录时间", "通知时钟", "序号(该关内)"]
         for col, h in enumerate(hist_headers, 1):
@@ -178,11 +356,19 @@ class ExcelStore:
         for col in range(1, 6):
             ws_hist.column_dimensions[get_column_letter(col)].width = 18
 
-        # 原子写入
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         wb.save(tmp)
         wb.close()
+        # 备份旧文件再替换，防止写入中断导致空表
+        if self.path.exists():
+            try:
+                shutil.copy2(self.path, self.path.with_suffix(".xlsx.bak"))
+            except Exception:
+                pass
         tmp.replace(self.path)
 
     def excel_path(self) -> Path:
         return self.path
+
+    def json_store_path(self) -> Path:
+        return self.json_path

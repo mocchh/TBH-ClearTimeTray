@@ -3,19 +3,50 @@
 TBH 通关时间托盘监控
 - Frida 附加 TaskBarHero，hook TMP SetText
 - 按关卡记录最近 10 次通关秒数
-- 写入 Excel 并自动计算平均
+- 写入 Excel/JSON 并自动计算平均（关闭后持久保留）
+- 默认关闭系统通知；托盘菜单适配 Windows DPI
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import sys
 import threading
 import time
 import traceback
-import webbrowser
 from datetime import datetime
 from pathlib import Path
+
+
+def enable_dpi_awareness() -> str:
+    """在创建任何 UI 之前调用，让托盘菜单/图标按系统缩放正确显示。"""
+    if os.name != "nt":
+        return "n/a"
+    # Per-Monitor DPI Aware v2
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return "per-monitor-v2"
+    except Exception:
+        pass
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return "per-monitor"
+    except Exception:
+        pass
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return "system"
+    except Exception:
+        pass
+    return "failed"
+
+
+# 尽早启用 DPI（import 重 UI 库之前）
+_DPI_MODE = enable_dpi_awareness()
+
 
 def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
@@ -38,17 +69,16 @@ def resource_dir() -> Path:
 APP_DIR = app_dir()
 RESOURCE_DIR = resource_dir()
 SCRIPT_PATH = RESOURCE_DIR / "clear_time_probe.js"
-# 若打包资源里没有，再尝试 exe 同目录
 if not SCRIPT_PATH.exists():
     SCRIPT_PATH = APP_DIR / "clear_time_probe.js"
 DATA_DIR = APP_DIR / "data"
 EXCEL_PATH = DATA_DIR / "clear_times.xlsx"
+JSON_PATH = DATA_DIR / "clear_times.json"
+CONFIG_PATH = DATA_DIR / "config.json"
 LOG_PATH = DATA_DIR / "tray.log"
 MAX_PER_STAGE = 10
-PROCESS_HINT = "TaskBarHero"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"  # 通知默认关 / 持久化 JSON / DPI
 
-# 保证子目录可 import（源码运行）
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 if str(RESOURCE_DIR) not in sys.path:
@@ -75,6 +105,58 @@ def log(msg: str) -> None:
         pass
 
 
+def default_config() -> dict:
+    return {
+        # 默认关闭系统通知 / 提示音
+        "notify_enabled": False,
+        "sound_enabled": False,
+        "max_per_stage": MAX_PER_STAGE,
+    }
+
+
+def load_config() -> dict:
+    ensure_dirs()
+    cfg = default_config()
+    if CONFIG_PATH.exists():
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg.update(raw)
+        except Exception as exc:
+            log(f"读取配置失败，使用默认: {exc}")
+    # 规范化
+    cfg["notify_enabled"] = bool(cfg.get("notify_enabled", False))
+    cfg["sound_enabled"] = bool(cfg.get("sound_enabled", False))
+    try:
+        cfg["max_per_stage"] = max(1, int(cfg.get("max_per_stage") or MAX_PER_STAGE))
+    except Exception:
+        cfg["max_per_stage"] = MAX_PER_STAGE
+    save_config(cfg)
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    ensure_dirs()
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        log(f"保存配置失败: {exc}")
+
+
+def get_dpi_scale() -> float:
+    if os.name != "nt":
+        return 1.0
+    try:
+        user32 = ctypes.windll.user32
+        hdc = user32.GetDC(0)
+        # LOGPIXELSX = 88
+        dpi = int(ctypes.windll.gdi32.GetDeviceCaps(hdc, 88) or 96)
+        user32.ReleaseDC(0, hdc)
+        return max(1.0, dpi / 96.0)
+    except Exception:
+        return 1.0
+
+
 class ClearTimeMonitor:
     def __init__(self, store: ExcelStore):
         self.store = store
@@ -88,7 +170,7 @@ class ClearTimeMonitor:
         self.hit_count = 0
         self._stop = threading.Event()
         self._worker = None
-        self._on_hit = None  # callback(snapshot)
+        self._on_hit = None
 
     def set_on_hit(self, cb):
         self._on_hit = cb
@@ -108,6 +190,12 @@ class ClearTimeMonitor:
         self._stop.set()
         self._detach()
         self.status = "已停止"
+        # 退出前再落盘一次，确保表格持久
+        try:
+            self.store._write_json()
+            self.store._write_workbook()
+        except Exception as exc:
+            log(f"退出保存数据: {exc}")
         log("监控已停止")
 
     def _detach(self):
@@ -142,8 +230,6 @@ class ClearTimeMonitor:
         return device, int(target.pid)
 
     def _attach(self) -> bool:
-        import frida
-
         if not SCRIPT_PATH.exists():
             self.status = "缺少探针脚本"
             log(f"找不到 {SCRIPT_PATH}")
@@ -208,7 +294,6 @@ class ClearTimeMonitor:
             log(traceback.format_exc())
 
     def _run_loop(self):
-        # 自动重连
         while not self._stop.is_set():
             try:
                 import frida  # noqa: F401
@@ -224,7 +309,6 @@ class ClearTimeMonitor:
                     time.sleep(3)
                     continue
             else:
-                # 进程是否还活着
                 try:
                     import frida
 
@@ -246,42 +330,25 @@ class ClearTimeMonitor:
 
 
 def make_icon(color=(30, 120, 200)):
+    """按 DPI 生成足够大的托盘图标，避免高分屏发糊。"""
     from PIL import Image, ImageDraw
 
-    size = 64
+    scale = get_dpi_scale()
+    # 逻辑 32，按缩放放大，且至少 64
+    size = max(64, int(round(32 * scale * 2)))
+    size = min(size, 256)
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.ellipse((4, 4, size - 5, size - 5), fill=color + (255,))
-    d.rectangle((20, 18, 44, 46), fill=(255, 255, 255, 230))
-    d.line((24, 26, 40, 26), fill=color + (255,), width=2)
-    d.line((24, 32, 40, 32), fill=color + (255,), width=2)
-    d.line((24, 38, 36, 38), fill=color + (255,), width=2)
+    pad = max(2, size // 16)
+    d.ellipse((pad, pad, size - pad - 1, size - pad - 1), fill=color + (255,))
+    # 简易表格图案
+    m = size // 4
+    d.rectangle((m, m - 2, size - m, size - m + 2), fill=(255, 255, 255, 235))
+    line_w = max(1, size // 32)
+    for y_ratio in (0.40, 0.52, 0.64):
+        y = int(size * y_ratio)
+        d.line((m + 4, y, size - m - 4, y), fill=color + (255,), width=line_w)
     return img
-
-
-def balloon(title: str, body: str):
-    """尽量弹出 Windows 通知。"""
-    try:
-        from pystray import Icon  # noqa: F401
-
-        # 部分环境用 winsound + 日志即可；优先 toast
-        pass
-    except Exception:
-        pass
-    try:
-        # 简单 toast（Win10+）
-        from win10toast import ToastNotifier  # type: ignore
-
-        ToastNotifier().show_toast(title, body, duration=4, threaded=True)
-        return
-    except Exception:
-        pass
-    try:
-        import ctypes
-
-        ctypes.windll.user32.MessageBoxW(0, body, title, 0x40 | 0x1000)
-    except Exception:
-        pass
 
 
 def open_path(path: Path):
@@ -297,7 +364,8 @@ def open_path(path: Path):
 
 def main():
     ensure_dirs()
-    log("=== TBH 通关时间托盘启动 ===")
+    log(f"=== TBH 通关时间托盘启动 v{APP_VERSION} ===")
+    log(f"DPI: mode={_DPI_MODE} scale={get_dpi_scale():.2f}")
 
     try:
         import frida  # noqa: F401
@@ -311,9 +379,15 @@ def main():
         print("请安装: pip install frida pystray pillow openpyxl")
         sys.exit(1)
 
-    store = ExcelStore(EXCEL_PATH, max_per_stage=MAX_PER_STAGE)
-    monitor = ClearTimeMonitor(store)
+    config = load_config()
+    store = ExcelStore(
+        EXCEL_PATH,
+        max_per_stage=int(config.get("max_per_stage") or MAX_PER_STAGE),
+        json_path=JSON_PATH,
+    )
+    log(f"已加载历史记录: {store.record_count()} 条 | Excel={EXCEL_PATH.name} JSON={JSON_PATH.name}")
 
+    monitor = ClearTimeMonitor(store)
     icon_ref = {"icon": None}
 
     def on_hit(snap: dict):
@@ -321,31 +395,39 @@ def main():
             f"{snap['stage']}  {snap['last_seconds']}秒\n"
             f"最近{snap['count']}次平均: {snap['average']}秒"
         )
-        log(f"通知: {body.replace(chr(10), ' | ')}")
-        # 托盘 title 更新
+        log(f"记录: {body.replace(chr(10), ' | ')}")
         ic = icon_ref.get("icon")
         if ic:
-            ic.title = f"TBH通关监控 | {monitor.last_hit}"
+            try:
+                ic.title = f"TBH通关监控 | {monitor.last_hit}"
+            except Exception:
+                pass
 
-        # 尝试 toast
+        # 默认关闭通知；仅配置开启时提示
+        if not config.get("notify_enabled"):
+            return
         try:
-            if hasattr(ic, "notify"):
+            if ic is not None and hasattr(ic, "notify"):
                 ic.notify(body, "通关时间已记录")
-                return
-        except Exception:
-            pass
-        # 不阻塞的轻提示：只写日志；可选 MessageBeep
-        try:
-            import winsound
+        except Exception as exc:
+            log(f"通知失败: {exc}")
+        if config.get("sound_enabled"):
+            try:
+                import winsound
 
-            winsound.MessageBeep(winsound.MB_ICONASTERISK)
-        except Exception:
-            pass
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            except Exception:
+                pass
 
     monitor.set_on_hit(on_hit)
     monitor.start()
 
     def action_open_excel(icon, item):
+        # 打开前再同步一次 Excel，避免只写了 JSON
+        try:
+            store._write_workbook()
+        except Exception as exc:
+            log(f"同步 Excel 失败(可能文件被占用): {exc}")
         open_path(EXCEL_PATH)
 
     def action_open_folder(icon, item):
@@ -356,14 +438,36 @@ def main():
         monitor._detach()
         monitor.status = "重连中…"
 
+    def action_toggle_notify(icon, item):
+        config["notify_enabled"] = not bool(config.get("notify_enabled"))
+        save_config(config)
+        log(f"通知已{'开启' if config['notify_enabled'] else '关闭'}")
+
+    def action_toggle_sound(icon, item):
+        config["sound_enabled"] = not bool(config.get("sound_enabled"))
+        save_config(config)
+        log(f"提示音已{'开启' if config['sound_enabled'] else '关闭'}")
+
     def action_quit(icon, item):
         monitor.stop()
         icon.stop()
+
+    def notify_text(item):
+        on = bool(config.get("notify_enabled"))
+        return f"{'✓ ' if on else ''}系统通知（默认关）"
+
+    def sound_text(item):
+        on = bool(config.get("sound_enabled"))
+        return f"{'✓ ' if on else ''}提示音（默认关）"
 
     menu = pystray.Menu(
         item(lambda icon: f"状态: {monitor.status}", None, enabled=False),
         item(lambda icon: f"最近: {monitor.last_hit or '暂无'}", None, enabled=False),
         item(lambda icon: f"累计命中: {monitor.hit_count}", None, enabled=False),
+        item(lambda icon: f"已存记录: {store.record_count()} 条", None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        item(notify_text, action_toggle_notify),
+        item(sound_text, action_toggle_sound),
         pystray.Menu.SEPARATOR,
         item("打开 Excel", action_open_excel),
         item("打开数据目录", action_open_folder),
@@ -375,11 +479,13 @@ def main():
     icon = pystray.Icon(
         "TBHClearTime",
         make_icon(),
-        "TBH 通关时间监控",
+        f"TBH 通关时间监控 v{APP_VERSION}",
         menu,
     )
     icon_ref["icon"] = icon
     log(f"Excel: {EXCEL_PATH}")
+    log(f"JSON:  {JSON_PATH}")
+    log(f"通知默认: {'开' if config.get('notify_enabled') else '关'}")
     icon.run()
     monitor.stop()
     log("托盘退出")
