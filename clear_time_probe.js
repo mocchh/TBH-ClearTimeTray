@@ -92,8 +92,8 @@ function emit(kind, payload) {
 // 去标签后: 通关了关卡 2-3。(48秒) [11:53]
 var RE_CLEAR = /通关[了]?\s*关卡\s*(\d+)\s*[-－—~～]\s*(\d+)\s*[。\.]?\s*[\(（]\s*(\d+)\s*秒\s*[\)）](?:\s*[\[【](\d{1,2}:\d{2})[\]】])?/;
 
-var g_recent = {};
-var RECENT_MS = 2500;
+// 会话级去重：通知列表刷新会反复 SetText 历史通关行，不能只靠短窗口
+var g_seenKeys = {};
 var g_hooked = 0;
 
 function stripRichText(text) {
@@ -126,12 +126,19 @@ function handleText(source, text) {
   var parsed = parseClearNotice(text);
   if (!parsed) return;
 
-  // 去重：同关卡+秒数+通知时钟 在短时间内只报一次
+  // 唯一键：关卡 + 秒数 + 通知时钟（同一条历史 toast 刷新不重复上报）
   var key = parsed.stage + '|' + parsed.clearSeconds + '|' + parsed.noticeTime;
-  var now = Date.now();
-  if (g_recent[key] && now - g_recent[key] < RECENT_MS) return;
-  g_recent[key] = now;
-  if (Object.keys(g_recent).length > 200) g_recent = {};
+  if (!parsed.noticeTime) {
+    // 无时钟时退化为关卡+秒数，同一会话只记一次
+    key = parsed.stage + '|' + parsed.clearSeconds;
+  }
+  if (g_seenKeys[key]) return;
+  g_seenKeys[key] = 1;
+  // 防止无限增长（保留最近约 500 条键）
+  var keys = Object.keys(g_seenKeys);
+  if (keys.length > 500) {
+    for (var i = 0; i < keys.length - 400; i++) delete g_seenKeys[keys[i]];
+  }
 
   emit('clear_time', {
     source: source,
@@ -140,7 +147,8 @@ function handleText(source, text) {
     level: parsed.level,
     clearSeconds: parsed.clearSeconds,
     noticeTime: parsed.noticeTime,
-    raw: parsed.raw
+    raw: parsed.raw,
+    dedupeKey: key
   });
 }
 

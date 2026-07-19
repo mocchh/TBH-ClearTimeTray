@@ -77,7 +77,7 @@ JSON_PATH = DATA_DIR / "clear_times.json"
 CONFIG_PATH = DATA_DIR / "config.json"
 LOG_PATH = DATA_DIR / "tray.log"
 MAX_PER_STAGE = 10
-APP_VERSION = "1.0.1"  # 通知默认关 / 持久化 JSON / DPI
+APP_VERSION = "1.0.2"  # 通关通知列表刷新去重
 
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
@@ -282,6 +282,12 @@ class ClearTimeMonitor:
                 return
 
             snap = self.store.add_clear(stage, sec, notice_time=notice)
+            if snap.get("skipped"):
+                # 通知列表刷新重复 SetText，不计入
+                log(
+                    f"去重跳过 {stage} {sec}秒 [{notice}] key={snap.get('dedupeKey')}"
+                )
+                return
             self.hit_count += 1
             self.last_hit = f"{stage} {sec}秒 (均{snap['average']}s / {snap['count']}次)"
             log(f"通关 {self.last_hit} raw={payload.get('raw')}")

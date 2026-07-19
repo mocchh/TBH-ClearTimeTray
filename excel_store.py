@@ -227,14 +227,41 @@ class ExcelStore:
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.json_path)
 
+    @staticmethod
+    def make_dedupe_key(stage: str, clear_seconds: int, notice_time: str = "") -> str:
+        stage = str(stage or "").strip()
+        notice = str(notice_time or "").strip()
+        sec = int(clear_seconds)
+        if notice:
+            return f"{stage}|{sec}|{notice}"
+        return f"{stage}|{sec}"
+
+    def has_dedupe_key(self, key: str) -> bool:
+        """是否已存在相同 关卡+秒数+通知时钟 的记录。"""
+        key = str(key or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            for stage, items in self._data.items():
+                for sec, _dt, notice in items:
+                    if self.make_dedupe_key(stage, sec, notice) == key:
+                        return True
+        return False
+
     def add_clear(
         self,
         stage: str,
         clear_seconds: int,
         notice_time: str = "",
         recorded_at: Optional[datetime] = None,
+        *,
+        allow_duplicate: bool = False,
     ) -> dict:
-        """写入一次通关。返回该关卡当前状态（含平均）。"""
+        """写入一次通关。返回该关卡当前状态（含平均）。
+
+        默认对 关卡+秒数+通知时钟 去重，避免通知列表刷新导致重复写入。
+        返回字典额外带 skipped=True 表示因重复被跳过。
+        """
         stage = str(stage or "").strip()
         if not stage:
             raise ValueError("empty stage")
@@ -243,11 +270,22 @@ class ExcelStore:
             raise ValueError(f"invalid seconds: {sec}")
         dt = recorded_at or datetime.now()
         notice = str(notice_time or "").strip()
+        key = self.make_dedupe_key(stage, sec, notice)
 
         with self._lock:
+            if not allow_duplicate:
+                for old_sec, _old_dt, old_notice in self._data.get(stage, []):
+                    if self.make_dedupe_key(stage, old_sec, old_notice) == key:
+                        snap = self.stage_snapshot(stage)
+                        snap["skipped"] = True
+                        snap["dedupeKey"] = key
+                        return snap
             self._data[stage].append((sec, dt, notice))
             self._persist_all()
-            return self.stage_snapshot(stage)
+            snap = self.stage_snapshot(stage)
+            snap["skipped"] = False
+            snap["dedupeKey"] = key
+            return snap
 
     def _persist_all(self) -> None:
         """先 JSON 后 Excel；Excel 失败不回滚 JSON。"""
