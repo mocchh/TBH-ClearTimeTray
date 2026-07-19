@@ -224,15 +224,28 @@ class ExcelStore:
 
     @staticmethod
     def make_dedupe_key(
-        difficulty: str, stage: str, clear_seconds: int, notice_time: str = ""
+        difficulty: str,
+        stage: str,
+        clear_seconds: int,
+        notice_time: str = "",
+        recorded_at: Optional[datetime] = None,
     ) -> str:
+        """去重键必须带日期。
+
+        游戏通知时钟只有 HH:MM，若永久用「关卡+秒数+时钟」去重，
+        会导致同一天之后同秒数通关再也写不进去，「最近记录时间」卡死。
+        列表刷新重复：同一天内相同 toast 仍会跳过。
+        """
         d = normalize_difficulty(difficulty)
         s = str(stage or "").strip()
         notice = str(notice_time or "").strip()
         sec = int(clear_seconds)
+        when = recorded_at or datetime.now()
+        day = when.strftime("%Y-%m-%d")
         if notice:
-            return f"{d}|{s}|{sec}|{notice}"
-        return f"{d}|{s}|{sec}"
+            return f"{d}|{s}|{sec}|{day}|{notice}"
+        # 无通知时钟：按本地分钟桶，避免永久锁死同秒数
+        return f"{d}|{s}|{sec}|{day}|{when.strftime('%H:%M')}"
 
     def add_clear(
         self,
@@ -254,15 +267,19 @@ class ExcelStore:
         notice = str(notice_time or "").strip()
         difficulty = normalize_difficulty(difficulty)
         key = make_stage_key(difficulty, stage)
-        dedupe = self.make_dedupe_key(difficulty, stage, sec, notice)
+        dedupe = self.make_dedupe_key(difficulty, stage, sec, notice, dt)
 
         with self._lock:
             if not allow_duplicate:
-                for old_sec, _old_dt, old_notice in self._data.get(key, []):
-                    if self.make_dedupe_key(difficulty, stage, old_sec, old_notice) == dedupe:
+                for old_sec, old_dt, old_notice in self._data.get(key, []):
+                    old_key = self.make_dedupe_key(
+                        difficulty, stage, old_sec, old_notice, old_dt
+                    )
+                    if old_key == dedupe:
                         snap = self.stage_snapshot(key)
                         snap["skipped"] = True
                         snap["dedupeKey"] = dedupe
+                        snap["skipReason"] = "same-day-toast"
                         return snap
             self._data[key].append((sec, dt, notice))
             self._persist_all()

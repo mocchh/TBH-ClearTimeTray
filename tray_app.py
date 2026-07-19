@@ -77,7 +77,7 @@ JSON_PATH = DATA_DIR / "clear_times.json"
 CONFIG_PATH = DATA_DIR / "config.json"
 LOG_PATH = DATA_DIR / "tray.log"
 MAX_PER_STAGE = 10
-APP_VERSION = "1.1.1"  # 游戏重启后自动重连
+APP_VERSION = "1.1.2"  # 修复最近记录时间卡死（去重键含日期）
 
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
@@ -440,13 +440,20 @@ send({ kind: 'module_probe', hit: hit, count: names.length });
             )
             if snap.get("skipped"):
                 log(
-                    f"去重跳过 {difficulty} {stage} {sec}秒 [{notice}] key={snap.get('dedupeKey')}"
+                    f"去重跳过 {difficulty} {stage} {sec}秒 通知钟=[{notice}] "
+                    f"最近记录仍为 {snap.get('last_at')} key={snap.get('dedupeKey')}"
                 )
                 return
             self.hit_count += 1
             disp = snap.get("display") or f"{difficulty} {stage}"
-            self.last_hit = f"{disp} {sec}秒 (均{snap['average']}s / {snap['count']}次)"
-            log(f"通关 {self.last_hit} diffSrc={diff_src} raw={payload.get('raw')}")
+            self.last_hit = (
+                f"{disp} {sec}秒 (均{snap['average']}s / {snap['count']}次) "
+                f"@{snap.get('last_at')}"
+            )
+            log(
+                f"通关写入 {self.last_hit} diffSrc={diff_src} "
+                f"通知钟=[{notice}] raw={payload.get('raw')}"
+            )
             if self._on_hit:
                 try:
                     self._on_hit(snap)
@@ -589,11 +596,15 @@ def main():
     monitor.start()
 
     def action_open_excel(icon, item):
-        # 打开前再同步一次 Excel，避免只写了 JSON
+        # 打开前再同步一次 Excel；若 Excel 正打开会被占用导致看起来“时间不更新”
         try:
             store._write_workbook()
+            log(f"已同步 Excel -> {EXCEL_PATH}")
         except Exception as exc:
-            log(f"同步 Excel 失败(可能文件被占用): {exc}")
+            log(
+                f"同步 Excel 失败(请先关闭 Excel 再打开菜单): {exc} | "
+                f"JSON 仍以 {JSON_PATH} 为准"
+            )
         open_path(EXCEL_PATH)
 
     def action_open_folder(icon, item):

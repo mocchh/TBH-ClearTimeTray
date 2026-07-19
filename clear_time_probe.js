@@ -299,7 +299,8 @@ function handleText(source, text) {
     rememberDifficulty(diff.id, diff.name, 'toast');
   }
 
-  // 唯一键：难度 + 关卡 + 秒数 + 通知时钟
+  // 会话去重：难度+关卡+秒数+通知时钟（阻止列表反复 SetText）
+  // 注意：跨天/真正新通关由 Python 侧按「日期+时钟」判断，这里只挡当前会话刷屏
   var key =
     (diff.name || '未知') +
     '|' +
@@ -308,8 +309,11 @@ function handleText(source, text) {
     parsed.clearSeconds +
     '|' +
     (parsed.noticeTime || '');
-  if (g_seenKeys[key]) return;
-  g_seenKeys[key] = 1;
+  var nowMs = Date.now();
+  var prev = g_seenKeys[key];
+  // 同一 toast 在 15 分钟内只上报一次（列表刷新）；超时允许再报（交给存储层按日期去重）
+  if (prev && nowMs - prev < 15 * 60 * 1000) return;
+  g_seenKeys[key] = nowMs;
   var keys = Object.keys(g_seenKeys);
   if (keys.length > 500) {
     for (var i = 0; i < keys.length - 400; i++) delete g_seenKeys[keys[i]];
