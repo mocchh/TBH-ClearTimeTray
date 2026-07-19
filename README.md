@@ -1,0 +1,104 @@
+# TBH 通关时间监控（托盘）
+
+系统托盘小程序：通过 Frida 读取 *Taskbar Hero* 通关通知，按关卡记录**最近 10 次**通关秒数，写入 Excel 并自动计算平均通关时间。
+
+## 功能
+
+- 系统托盘常驻，自动附加 `TaskBarHero` 进程
+- Hook `TMP_Text.SetText`，解析通关富文本通知
+- 按关卡滚动保存最近 10 次秒数
+- 生成 `data/clear_times.xlsx`（汇总 + 明细 + 平均）
+- 进程退出后自动重连
+
+## 通关文案格式
+
+界面显示：
+
+```text
+通关了关卡 2-9 (199秒) [11:32]
+```
+
+内存中为 TMP 富文本，例如：
+
+```text
+通关了<color=#A69255>关卡 2-3</color>。(48秒) <voffset=-0.7px><size=8>[11:53]</size></voffset>
+```
+
+## 环境
+
+- Windows 10/11 x64
+- Python 3.10+（源码运行）
+- 建议**管理员权限**运行，以便 Frida 附加游戏
+
+## 安装依赖
+
+```powershell
+cd TBH-ClearTimeTray
+pip install -r requirements.txt
+```
+
+## 源码运行
+
+```powershell
+python -u tray_app.py
+```
+
+或双击 `run.bat`。
+
+## 打包 EXE
+
+```powershell
+.\build_exe.bat
+```
+
+产物：`dist\TBH通关时间监控.exe`
+
+也可：
+
+```powershell
+pip install pyinstaller
+pyinstaller --noconfirm --clean --onefile --windowed --name "TBH通关时间监控" --add-data "clear_time_probe.js;." --hidden-import excel_store --collect-all frida --collect-all pystray --collect-all openpyxl tray_app.py
+```
+
+## 托盘菜单
+
+| 菜单 | 说明 |
+|------|------|
+| 打开 Excel | 打开 `data/clear_times.xlsx` |
+| 打开数据目录 | 打开 `data/` |
+| 重新连接游戏 | 重新附加进程 |
+| 退出 | 结束程序 |
+
+数据目录位于 **exe 同级**（或源码目录）下的 `data/`。
+
+## Excel 结构
+
+**汇总**
+
+| 关卡 | 第1次…第10次(秒) | 样本数 | 平均通关(秒) | 最近记录时间 | 最近通知时钟 |
+|------|------------------|--------|--------------|--------------|--------------|
+
+**明细**：各关最近最多 10 条原始记录。
+
+## 目录
+
+```text
+TBH-ClearTimeTray/
+├── tray_app.py
+├── excel_store.py
+├── clear_time_probe.js
+├── build_exe.bat
+├── run.bat
+├── requirements.txt
+└── data/                 # 运行后生成
+    ├── clear_times.xlsx
+    └── tray.log
+```
+
+## 免责声明
+
+本项目仅供学习与研究。使用 Frida 注入、内存读取可能违反游戏用户协议。请自行承担使用风险；作者不对账号、数据或系统损失负责。
+
+## License
+
+MIT
