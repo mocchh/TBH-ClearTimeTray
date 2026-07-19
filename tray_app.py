@@ -77,7 +77,7 @@ JSON_PATH = DATA_DIR / "clear_times.json"
 CONFIG_PATH = DATA_DIR / "config.json"
 LOG_PATH = DATA_DIR / "tray.log"
 MAX_PER_STAGE = 10
-APP_VERSION = "1.1.2"  # 修复最近记录时间卡死（去重键含日期）
+APP_VERSION = "1.1.4"  # Excel 去掉通知钟，布局同 1.1.2
 
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
@@ -440,7 +440,7 @@ send({ kind: 'module_probe', hit: hit, count: names.length });
             )
             if snap.get("skipped"):
                 log(
-                    f"去重跳过 {difficulty} {stage} {sec}秒 通知钟=[{notice}] "
+                    f"去重跳过 {difficulty} {stage} {sec}秒 "
                     f"最近记录仍为 {snap.get('last_at')} key={snap.get('dedupeKey')}"
                 )
                 return
@@ -450,10 +450,7 @@ send({ kind: 'module_probe', hit: hit, count: names.length });
                 f"{disp} {sec}秒 (均{snap['average']}s / {snap['count']}次) "
                 f"@{snap.get('last_at')}"
             )
-            log(
-                f"通关写入 {self.last_hit} diffSrc={diff_src} "
-                f"通知钟=[{notice}] raw={payload.get('raw')}"
-            )
+            log(f"通关写入 {self.last_hit} diffSrc={diff_src} raw={payload.get('raw')}")
             if self._on_hit:
                 try:
                     self._on_hit(snap)
@@ -596,16 +593,18 @@ def main():
     monitor.start()
 
     def action_open_excel(icon, item):
-        # 打开前再同步一次 Excel；若 Excel 正打开会被占用导致看起来“时间不更新”
-        try:
-            store._write_workbook()
-            log(f"已同步 Excel -> {EXCEL_PATH}")
-        except Exception as exc:
+        # 先按 JSON 重写 Excel。主文件被占用时写 clear_times_最新.xlsx
+        ok, path, err = store._write_workbook_safe()
+        if ok:
+            log(f"已同步 Excel -> {path}")
+            open_path(path)
+        else:
             log(
-                f"同步 Excel 失败(请先关闭 Excel 再打开菜单): {exc} | "
-                f"JSON 仍以 {JSON_PATH} 为准"
+                f"同步 Excel 失败: {err} | 请先【关闭已打开的表格】后重试；"
+                f"JSON 已是最新: {JSON_PATH}"
             )
-        open_path(EXCEL_PATH)
+            # 仍尝试打开主文件（可能是旧缓存）
+            open_path(EXCEL_PATH)
 
     def action_open_folder(icon, item):
         open_path(DATA_DIR)
@@ -643,6 +642,14 @@ def main():
         item(lambda icon: f"最近: {monitor.last_hit or '暂无'}", None, enabled=False),
         item(lambda icon: f"累计命中: {monitor.hit_count}", None, enabled=False),
         item(lambda icon: f"已存记录: {store.record_count()} 条", None, enabled=False),
+        item(
+            lambda icon: (
+                f"Excel: {store.last_excel_path.name}"
+                + (f" (写失败)" if store.last_excel_error else "")
+            ),
+            None,
+            enabled=False,
+        ),
         pystray.Menu.SEPARATOR,
         item(notify_text, action_toggle_notify),
         item(sound_text, action_toggle_sound),

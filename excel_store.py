@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
 from collections import defaultdict, deque
@@ -89,10 +90,16 @@ class ExcelStore:
             lambda: deque(maxlen=self.max_per_stage)
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._last_excel_error = ""
+        self._last_excel_path = self.path
         self._load_persistent()
         try:
-            self._write_workbook()
             self._write_json()
+            ok, path, err = self._write_workbook_safe()
+            if ok:
+                self._last_excel_path = path
+            else:
+                self._last_excel_error = err
         except Exception:
             pass
 
@@ -289,16 +296,24 @@ class ExcelStore:
             return snap
 
     def _persist_all(self) -> None:
+        """JSON 必写；Excel 失败不回滚 JSON（占用时写备用文件）。"""
         self._write_json()
-        try:
-            self._write_workbook()
-        except Exception:
-            try:
-                if self.path.exists():
-                    shutil.copy2(self.path, self.path.with_suffix(".xlsx.bak"))
-            except Exception:
-                pass
-            raise
+        ok, path, err = self._write_workbook_safe()
+        if not ok:
+            # 不 raise：否则调用方以为整次通关失败；JSON 已是真相
+            self._last_excel_error = err
+        else:
+            self._last_excel_error = ""
+            self._last_excel_path = path
+
+    @property
+    def last_excel_error(self) -> str:
+        return str(getattr(self, "_last_excel_error", "") or "")
+
+    @property
+    def last_excel_path(self) -> Path:
+        p = getattr(self, "_last_excel_path", None)
+        return Path(p) if p else self.path
 
     def stage_snapshot(self, key_or_stage: str, difficulty: str = "") -> dict:
         if difficulty:
@@ -310,18 +325,33 @@ class ExcelStore:
         with self._lock:
             items = list(self._data.get(key, []))
         d, s = split_stage_key(key)
-        secs = [x[0] for x in items]
-        avg = round(sum(secs) / len(secs), 2) if secs else 0.0
+        # items 按时间从旧到新；展示用「最近」取时间最大的一条
+        if items:
+            newest = max(items, key=lambda x: x[1] if isinstance(x[1], datetime) else _parse_dt(x[1]))
+            secs_old_to_new = [x[0] for x in items]
+            last_sec = newest[0]
+            last_at = newest[1]
+            if not isinstance(last_at, datetime):
+                last_at = _parse_dt(last_at)
+            last_notice = newest[2]
+        else:
+            secs_old_to_new = []
+            last_sec = None
+            last_at = None
+            last_notice = ""
+        avg = (
+            round(sum(secs_old_to_new) / len(secs_old_to_new), 2) if secs_old_to_new else 0.0
+        )
         return {
             "key": key,
             "difficulty": d,
             "stage": s,
-            "count": len(secs),
-            "seconds": secs,
+            "count": len(secs_old_to_new),
+            "seconds": secs_old_to_new,
             "average": avg,
-            "last_seconds": secs[-1] if secs else None,
-            "last_at": items[-1][1].strftime("%Y-%m-%d %H:%M:%S") if items else "",
-            "notice_time": items[-1][2] if items else "",
+            "last_seconds": last_sec,
+            "last_at": last_at.strftime("%Y-%m-%d %H:%M:%S") if last_at else "",
+            "notice_time": last_notice or "",
             "display": f"{d} {s}" if d != "未知" else s,
         }
 
@@ -345,14 +375,15 @@ class ExcelStore:
             a, b = 9999, 9999
         return (order.get(d, 8), a, b)
 
-    def _write_workbook(self) -> None:
+    def _build_workbook(self) -> Workbook:
+        """汇总布局与 v1.1.2 一致：难度|关卡|第1~10次|样本数|平均|最近记录时间（无通知钟）。"""
         wb = Workbook()
         ws_sum = wb.active
         ws_sum.title = SUMMARY_SHEET
         headers = (
             ["难度", "关卡"]
             + [f"第{i}次(秒)" for i in range(1, self.max_per_stage + 1)]
-            + ["样本数", "平均通关(秒)", "最近记录时间", "最近通知时钟"]
+            + ["样本数", "平均通关(秒)", "最近记录时间"]
         )
         header_fill = PatternFill("solid", fgColor="1F4E79")
         header_font = Font(color="FFFFFF", bold=True)
@@ -367,8 +398,18 @@ class ExcelStore:
         for r, key in enumerate(keys, 2):
             difficulty, stage = split_stage_key(key)
             items = list(self._data[key])
+            # 旧 → 新（与 1.1.2 相同）
             secs = [x[0] for x in items]
             avg = round(sum(secs) / len(secs), 2) if secs else ""
+            if items:
+                newest = max(
+                    items,
+                    key=lambda x: x[1] if isinstance(x[1], datetime) else _parse_dt(x[1]),
+                )
+                last_dt = newest[1] if isinstance(newest[1], datetime) else _parse_dt(newest[1])
+            else:
+                last_dt = None
+
             ws_sum.cell(r, 1, difficulty)
             ws_sum.cell(r, 2, stage)
             for i in range(self.max_per_stage):
@@ -377,18 +418,21 @@ class ExcelStore:
             avg_cell = ws_sum.cell(r, 4 + self.max_per_stage, avg)
             avg_cell.fill = avg_fill
             avg_cell.font = Font(bold=True)
-            last_at = items[-1][1].strftime("%Y-%m-%d %H:%M:%S") if items else ""
-            last_notice = items[-1][2] if items else ""
-            ws_sum.cell(r, 5 + self.max_per_stage, last_at)
-            ws_sum.cell(r, 6 + self.max_per_stage, last_notice)
+            time_cell = ws_sum.cell(
+                r,
+                5 + self.max_per_stage,
+                last_dt.strftime("%Y-%m-%d %H:%M:%S") if last_dt else "",
+            )
+            time_cell.alignment = Alignment(horizontal="center")
 
         for col in range(1, len(headers) + 1):
             ws_sum.column_dimensions[get_column_letter(col)].width = 14
         ws_sum.column_dimensions["A"].width = 10
         ws_sum.column_dimensions["B"].width = 10
+        ws_sum.column_dimensions[get_column_letter(5 + self.max_per_stage)].width = 20
 
         ws_hist = wb.create_sheet(HISTORY_SHEET)
-        hist_headers = ["难度", "关卡", "通关秒数", "记录时间", "通知时钟", "序号(该关内)"]
+        hist_headers = ["难度", "关卡", "通关秒数", "记录时间", "序号(该关内)"]
         for col, h in enumerate(hist_headers, 1):
             cell = ws_hist.cell(1, col, h)
             cell.fill = header_fill
@@ -397,26 +441,67 @@ class ExcelStore:
         for key in keys:
             difficulty, stage = split_stage_key(key)
             items = list(self._data[key])
-            for idx, (sec, dt, notice) in enumerate(items, 1):
+            for idx, (sec, dt, _notice) in enumerate(items, 1):
+                if not isinstance(dt, datetime):
+                    dt = _parse_dt(dt)
                 ws_hist.cell(row_i, 1, difficulty)
                 ws_hist.cell(row_i, 2, stage)
                 ws_hist.cell(row_i, 3, sec)
                 ws_hist.cell(row_i, 4, dt.strftime("%Y-%m-%d %H:%M:%S"))
-                ws_hist.cell(row_i, 5, notice)
-                ws_hist.cell(row_i, 6, idx)
+                ws_hist.cell(row_i, 5, idx)
                 row_i += 1
-        for col in range(1, 7):
-            ws_hist.column_dimensions[get_column_letter(col)].width = 16
+        for col in range(1, 6):
+            ws_hist.column_dimensions[get_column_letter(col)].width = 18
+        return wb
 
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        wb.save(tmp)
-        wb.close()
-        if self.path.exists():
+    def _write_workbook_safe(self) -> tuple:
+        """写入 Excel。主文件被占用时写入 clear_times_最新.xlsx。
+
+        返回 (ok, path, error_message)
+        """
+        wb = self._build_workbook()
+        candidates = [
+            self.path,
+            self.path.parent / "clear_times_最新.xlsx",
+        ]
+        last_err = ""
+        tmp = self.path.parent / f".~clear_times_{os.getpid()}.xlsx"
+        try:
+            wb.save(tmp)
+        finally:
+            wb.close()
+
+        for target in candidates:
             try:
-                shutil.copy2(self.path, self.path.with_suffix(".xlsx.bak"))
-            except Exception:
-                pass
-        tmp.replace(self.path)
+                if target.exists():
+                    try:
+                        shutil.copy2(target, target.with_suffix(target.suffix + ".bak"))
+                    except Exception:
+                        pass
+                mid = target.with_suffix(target.suffix + ".partial")
+                shutil.copy2(tmp, mid)
+                mid.replace(target)
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except Exception:
+                    pass
+                return True, target, ""
+            except Exception as exc:
+                last_err = str(exc)
+                continue
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False, self.path, last_err or "excel write failed"
+
+    def _write_workbook(self) -> None:
+        """兼容旧调用：失败抛错。"""
+        ok, _path, err = self._write_workbook_safe()
+        if not ok:
+            raise OSError(err or "excel write failed")
 
     def excel_path(self) -> Path:
         return self.path
