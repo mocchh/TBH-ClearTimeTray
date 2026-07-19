@@ -2,7 +2,13 @@
 
 /**
  * TBH 通关时间探针 — 托盘程序用
- * 实际 TMP: 通关了<color=...>关卡 2-3</color>。(48秒) <...>[11:53]</...>
+ *
+ * 通关 toast（无难度文字）:
+ *   通关了<color=...>关卡 2-3</color>。(48秒) <...>[11:53]</...>
+ *
+ * 难度来源（游戏内 0~3）:
+ *   UI_Portal.m_currentStageDifficulty
+ *   0=普通 1=噩梦 2=地狱 3=折磨
  */
 
 var GA = Process.enumerateModules().find(function (m) {
@@ -19,9 +25,22 @@ var il2cpp_domain_get_assemblies = api('il2cpp_domain_get_assemblies', 'pointer'
 var il2cpp_assembly_get_image = api('il2cpp_assembly_get_image', 'pointer', ['pointer']);
 var il2cpp_class_from_name = api('il2cpp_class_from_name', 'pointer', ['pointer', 'pointer', 'pointer']);
 var il2cpp_class_get_method_from_name = api('il2cpp_class_get_method_from_name', 'pointer', ['pointer', 'pointer', 'int']);
+var il2cpp_class_get_field_from_name = api('il2cpp_class_get_field_from_name', 'pointer', ['pointer', 'pointer']);
+var il2cpp_field_get_offset = api('il2cpp_field_get_offset', 'int', ['pointer']);
+var il2cpp_class_get_methods = api('il2cpp_class_get_methods', 'pointer', ['pointer', 'pointer']);
+var il2cpp_method_get_name = api('il2cpp_method_get_name', 'pointer', ['pointer']);
 
 function cstr(s) {
   return Memory.allocUtf8String(s);
+}
+
+function readCString(p) {
+  try {
+    if (!p || p.isNull()) return '';
+    return p.readUtf8String() || '';
+  } catch (e) {
+    return '';
+  }
 }
 
 function methodPtr(methodInfo) {
@@ -68,18 +87,22 @@ function readIl2CppString(strObj) {
   }
 }
 
+function isReadable(p) {
+  try {
+    if (!p || p.isNull()) return false;
+    var r = Process.findRangeByAddress(p);
+    return !!(r && r.protection.indexOf('r') !== -1);
+  } catch (e) {
+    return false;
+  }
+}
+
 function nowStamp() {
   var d = new Date();
   function p(n) {
     return n < 10 ? '0' + n : '' + n;
   }
-  return (
-    p(d.getHours()) +
-    ':' +
-    p(d.getMinutes()) +
-    ':' +
-    p(d.getSeconds())
-  );
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
 }
 
 function emit(kind, payload) {
@@ -89,10 +112,133 @@ function emit(kind, payload) {
   send(payload);
 }
 
-// 去标签后: 通关了关卡 2-3。(48秒) [11:53]
+// ---------- 难度 ----------
+// 0=普通 1=噩梦 2=地狱 3=折磨（与 TBH-DropMonitor / UI_Portal 一致）
+var DIFF_NAMES = ['普通', '噩梦', '地狱', '折磨'];
+var g_portal = ptr(0);
+var g_diffOffset = -1;
+var g_lastDiffId = -1;
+var g_lastDiffName = '未知';
+var g_portalHooks = 0;
+
+function difficultyName(id) {
+  id = parseInt(id, 10);
+  if (id >= 0 && id <= 3) return DIFF_NAMES[id];
+  return '未知';
+}
+
+function parseDifficultyFromText(text) {
+  var t = stripRichText(text || '');
+  if (!t) return null;
+  // 纯按钮/页签
+  if (t === '普通' || t === '噩梦' || t === '地狱' || t === '折磨') return t;
+  // 带前缀：折磨 2-9 / [折磨]关卡
+  if (t.indexOf('折磨') >= 0) return '折磨';
+  if (t.indexOf('地狱') >= 0) return '地狱';
+  if (t.indexOf('噩梦') >= 0) return '噩梦';
+  // 「普通」太泛，仅整词匹配
+  if (/(^|[^a-zA-Z\u4e00-\u9fff])普通([^a-zA-Z\u4e00-\u9fff]|$)/.test(t) && t.length <= 12) return '普通';
+  return null;
+}
+
+function difficultyIdFromName(name) {
+  for (var i = 0; i < DIFF_NAMES.length; i++) {
+    if (DIFF_NAMES[i] === name) return i;
+  }
+  return -1;
+}
+
+function rememberDifficulty(id, name, source) {
+  if (typeof id === 'number' && id >= 0 && id <= 3) {
+    g_lastDiffId = id;
+    g_lastDiffName = difficultyName(id);
+    return;
+  }
+  if (name && DIFF_NAMES.indexOf(name) >= 0) {
+    g_lastDiffName = name;
+    g_lastDiffId = difficultyIdFromName(name);
+  }
+}
+
+function readPortalDifficulty() {
+  if (g_diffOffset < 0) return null;
+  if (!isReadable(g_portal)) return null;
+  try {
+    var v = g_portal.add(g_diffOffset).readS32();
+    if (v >= 0 && v <= 3) {
+      rememberDifficulty(v, null, 'portal');
+      return { id: v, name: difficultyName(v), source: 'UI_Portal' };
+    }
+  } catch (e) {}
+  return null;
+}
+
+function currentDifficulty() {
+  var fromPortal = readPortalDifficulty();
+  if (fromPortal) return fromPortal;
+  if (g_lastDiffId >= 0) {
+    return { id: g_lastDiffId, name: g_lastDiffName || difficultyName(g_lastDiffId), source: 'cached' };
+  }
+  if (g_lastDiffName && g_lastDiffName !== '未知') {
+    return { id: difficultyIdFromName(g_lastDiffName), name: g_lastDiffName, source: 'cached-name' };
+  }
+  return { id: -1, name: '未知', source: 'none' };
+}
+
+function setupPortalDifficultyCapture() {
+  var klass = findClass('TaskbarHero.UI', 'UI_Portal');
+  if (!klass || klass.isNull()) {
+    emit('status', { text: 'UI_Portal class not found' });
+    return;
+  }
+  try {
+    var field = il2cpp_class_get_field_from_name(klass, cstr('m_currentStageDifficulty'));
+    if (field && !field.isNull()) {
+      g_diffOffset = il2cpp_field_get_offset(field);
+      emit('status', { text: 'UI_Portal.m_currentStageDifficulty offset=0x' + g_diffOffset.toString(16) });
+    } else {
+      emit('status', { text: 'm_currentStageDifficulty field not found' });
+    }
+  } catch (e) {
+    emit('status', { text: 'field resolve failed: ' + e });
+  }
+
+  // 捕获 portal 实例：hook 若干实例方法的 this
+  try {
+    var iter = Memory.alloc(Process.pointerSize);
+    iter.writePointer(ptr(0));
+    var n = 0;
+    while (n < 120 && g_portalHooks < 40) {
+      var method = il2cpp_class_get_methods(klass, iter);
+      if (!method || method.isNull()) break;
+      var name = readCString(il2cpp_method_get_name(method));
+      n++;
+      if (!name || name === '.ctor' || name === '.cctor') continue;
+      var fp = methodPtr(method);
+      if (!fp || fp.isNull()) continue;
+      try {
+        Interceptor.attach(fp, {
+          onEnter: function (args) {
+            try {
+              if (args[0] && !args[0].isNull() && isReadable(args[0])) {
+                g_portal = args[0];
+                readPortalDifficulty();
+              }
+            } catch (e0) {}
+          }
+        });
+        g_portalHooks++;
+      } catch (e1) {}
+    }
+  } catch (e) {
+    emit('status', { text: 'portal instance hook failed: ' + e });
+  }
+  emit('status', { text: 'UI_Portal instance hooks=' + g_portalHooks });
+}
+
+// ---------- 通关解析 ----------
 var RE_CLEAR = /通关[了]?\s*关卡\s*(\d+)\s*[-－—~～]\s*(\d+)\s*[。\.]?\s*[\(（]\s*(\d+)\s*秒\s*[\)）](?:\s*[\[【](\d{1,2}:\d{2})[\]】])?/;
 
-// 会话级去重：通知列表刷新会反复 SetText 历史通关行，不能只靠短窗口
 var g_seenKeys = {};
 var g_hooked = 0;
 
@@ -121,20 +267,37 @@ function parseClearNotice(text) {
 
 function handleText(source, text) {
   if (!text || typeof text !== 'string') return;
+
+  // 从 UI 文案侧路更新难度（页签等）
+  var diffName = parseDifficultyFromText(text);
+  if (diffName && text.indexOf('通关') < 0) {
+    rememberDifficulty(-1, diffName, source);
+  }
+
   if (text.indexOf('通关') < 0) return;
 
   var parsed = parseClearNotice(text);
   if (!parsed) return;
 
-  // 唯一键：关卡 + 秒数 + 通知时钟（同一条历史 toast 刷新不重复上报）
-  var key = parsed.stage + '|' + parsed.clearSeconds + '|' + parsed.noticeTime;
-  if (!parsed.noticeTime) {
-    // 无时钟时退化为关卡+秒数，同一会话只记一次
-    key = parsed.stage + '|' + parsed.clearSeconds;
+  var diff = currentDifficulty();
+  // toast 自身若带难度字样，优先用
+  var inText = parseDifficultyFromText(parsed.raw);
+  if (inText) {
+    diff = { id: difficultyIdFromName(inText), name: inText, source: 'toast-text' };
+    rememberDifficulty(diff.id, diff.name, 'toast');
   }
+
+  // 唯一键：难度 + 关卡 + 秒数 + 通知时钟
+  var key =
+    (diff.name || '未知') +
+    '|' +
+    parsed.stage +
+    '|' +
+    parsed.clearSeconds +
+    '|' +
+    (parsed.noticeTime || '');
   if (g_seenKeys[key]) return;
   g_seenKeys[key] = 1;
-  // 防止无限增长（保留最近约 500 条键）
   var keys = Object.keys(g_seenKeys);
   if (keys.length > 500) {
     for (var i = 0; i < keys.length - 400; i++) delete g_seenKeys[keys[i]];
@@ -147,6 +310,9 @@ function handleText(source, text) {
     level: parsed.level,
     clearSeconds: parsed.clearSeconds,
     noticeTime: parsed.noticeTime,
+    difficulty: diff.name || '未知',
+    difficultyId: typeof diff.id === 'number' ? diff.id : -1,
+    difficultySource: diff.source || 'none',
     raw: parsed.raw,
     dedupeKey: key
   });
@@ -173,10 +339,13 @@ function tryHook(fp, label) {
 }
 
 function installHooks() {
+  setupPortalDifficultyCapture();
+
   var targets = [
     { ns: 'TMPro', klass: 'TMP_Text', name: 'SetText', argcs: [1, 2, 3, 4] },
     { ns: 'TMPro', klass: 'TextMeshProUGUI', name: 'SetText', argcs: [1, 2, 3, 4] },
-    { ns: 'TMPro', klass: 'TMP_Text', name: 'set_text', argcs: [1] }
+    { ns: 'TMPro', klass: 'TMP_Text', name: 'set_text', argcs: [1] },
+    { ns: 'UnityEngine.UI', klass: 'Text', name: 'set_text', argcs: [1] }
   ];
   var seen = {};
   targets.forEach(function (t) {
@@ -189,12 +358,25 @@ function installHooks() {
       tryHook(fp, t.klass + '.' + t.name + '/' + argc);
     });
   });
-  emit('status', { text: 'hooks=' + g_hooked, hooked: g_hooked });
+  emit('status', {
+    text: 'hooks=' + g_hooked + ' portalHooks=' + g_portalHooks + ' diffOffset=' + g_diffOffset,
+    hooked: g_hooked
+  });
 }
 
 rpc.exports = {
   stats: function () {
-    return { hooked: g_hooked };
+    var d = currentDifficulty();
+    return {
+      hooked: g_hooked,
+      portalHooks: g_portalHooks,
+      diffOffset: g_diffOffset,
+      difficulty: d.name,
+      difficultyId: d.id
+    };
+  },
+  getDifficulty: function () {
+    return currentDifficulty();
   }
 };
 

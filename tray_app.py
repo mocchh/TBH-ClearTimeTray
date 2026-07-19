@@ -77,7 +77,7 @@ JSON_PATH = DATA_DIR / "clear_times.json"
 CONFIG_PATH = DATA_DIR / "config.json"
 LOG_PATH = DATA_DIR / "tray.log"
 MAX_PER_STAGE = 10
-APP_VERSION = "1.0.2"  # 通关通知列表刷新去重
+APP_VERSION = "1.1.0"  # 区分难度 普通/噩梦/地狱/折磨
 
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
@@ -278,19 +278,25 @@ class ClearTimeMonitor:
             stage = str(payload.get("stage") or "").strip()
             sec = int(payload.get("clearSeconds") or 0)
             notice = str(payload.get("noticeTime") or "")
+            difficulty = str(payload.get("difficulty") or "未知").strip() or "未知"
+            diff_src = str(payload.get("difficultySource") or "")
             if not stage or sec <= 0:
                 return
 
-            snap = self.store.add_clear(stage, sec, notice_time=notice)
+            snap = self.store.add_clear(
+                stage, sec, notice_time=notice, difficulty=difficulty
+            )
             if snap.get("skipped"):
-                # 通知列表刷新重复 SetText，不计入
                 log(
-                    f"去重跳过 {stage} {sec}秒 [{notice}] key={snap.get('dedupeKey')}"
+                    f"去重跳过 {difficulty} {stage} {sec}秒 [{notice}] key={snap.get('dedupeKey')}"
                 )
                 return
             self.hit_count += 1
-            self.last_hit = f"{stage} {sec}秒 (均{snap['average']}s / {snap['count']}次)"
-            log(f"通关 {self.last_hit} raw={payload.get('raw')}")
+            disp = snap.get("display") or f"{difficulty} {stage}"
+            self.last_hit = f"{disp} {sec}秒 (均{snap['average']}s / {snap['count']}次)"
+            log(
+                f"通关 {self.last_hit} diffSrc={diff_src} raw={payload.get('raw')}"
+            )
             if self._on_hit:
                 try:
                     self._on_hit(snap)
@@ -397,8 +403,9 @@ def main():
     icon_ref = {"icon": None}
 
     def on_hit(snap: dict):
+        disp = snap.get("display") or snap.get("stage") or ""
         body = (
-            f"{snap['stage']}  {snap['last_seconds']}秒\n"
+            f"{disp}  {snap['last_seconds']}秒\n"
             f"最近{snap['count']}次平均: {snap['average']}秒"
         )
         log(f"记录: {body.replace(chr(10), ' | ')}")
